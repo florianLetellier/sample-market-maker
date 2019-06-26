@@ -83,7 +83,7 @@ class BitMEXWebsocket():
 
     def get_ticker(self, symbol):
         '''Return a ticker object. Generated from quote and trade.'''
-        print("GETTICKER")
+        self.logger.info("GETTICKER")
         max_buy = 0
         min_sell = 100000
         for o in self.data['orderBookL2']:
