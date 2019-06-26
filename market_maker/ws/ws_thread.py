@@ -83,6 +83,7 @@ class BitMEXWebsocket():
 
     def get_ticker(self, symbol):
         '''Return a ticker object. Generated from quote and trade.'''
+        print("GETTICKER")
         max_buy = 0
         min_sell = 100000
         for o in self.data['orderBookL2']:
@@ -334,7 +335,7 @@ if __name__ == "__main__":
     logger.addHandler(ch)
     ws = BitMEXWebsocket()
     ws.logger = logger
-    ws.connect("https://bitmex.com/api/v1")
+    ws.connect("wss://www.bitmex.com/")
     while(ws.ws.sock.connected):
         sleep(1)
 
