@@ -1,74 +1,53 @@
+import sys
 import websocket
 import threading
 import traceback
-import decimal
 import ssl
 from time import sleep
 import json
+import decimal
 import logging
-import urllib
-import math
-from market_maker.utils.api_key import generate_nonce, generate_signature
 from market_maker.settings import settings
+from market_maker.auth.APIKeyAuth import generate_expires, generate_signature
+from market_maker.utils.log import setup_custom_logger
+from market_maker.utils.math import toNearest
 from future.utils import iteritems
 from future.standard_library import hooks
 with hooks():  # Python 2/3 compat
     from urllib.parse import urlparse, urlunparse
-# Naive implementation of connecting to BitMEX websocket for streaming realtime data.
+
+
+# Connects to BitMEX websocket for streaming realtime data.
 # The Marketmaker still interacts with this as if it were a REST Endpoint, but now it can get
-# much more realtime data without polling the hell out of the API.
+# much more realtime data without heavily polling the API.
 #
 # The Websocket offers a bunch of data as raw properties right on the object.
 # On connect, it synchronously asks for a push of all this data then returns.
 # Right after, the MM can start using its data. It will be updated in realtime, so the MM can
-# poll really often if it wants.
-class BitMEXWebsocket:
+# poll as often as it wants.
+class BitMEXWebsocket():
 
     # Don't grow a table larger than this amount. Helps cap memory usage.
     MAX_TABLE_LEN = 200
 
-    def __init__(self, endpoint, symbol, api_key=None, api_secret=None):
+    def __init__(self):
         self.logger = logging.getLogger('root')
         self.__reset()
-        # self.logger.debug("Initializing WebSocket.")
 
-        # self.endpoint = endpoint
-        # self.symbol = symbol
-
-        # if api_key is not None and api_secret is None:
-        #     raise ValueError('api_secret is required if api_key is provided')
-        # if api_key is None and api_secret is not None:
-        #     raise ValueError('api_key is required if api_secret is provided')
-
-        # self.api_key = api_key
-        # self.api_secret = api_secret
-
-        # self.data = {}
-        # self.keys = {}
-        # self.exited = False
-
-        # # We can subscribe right in the connection querystring, so let's build that.
-        # # Subscribe to all pertinent endpoints
-        # wsURL = self.__get_url()
-        # self.logger.info("Connecting to %s" % wsURL)
-        # self.__connect(wsURL, symbol)
-        # self.logger.info('Connected to WS.')
-
-        # # Connected. Wait for partials
-        # self.__wait_for_symbol(symbol)
-        # if api_key:
-        #     self.__wait_for_account()
-        # self.logger.info('Got all market data. Starting.')
+    def __del__(self):
+        self.exit()
 
     def connect(self, endpoint="", symbol="XBTN15", shouldAuth=True):
+        '''Connect to the websocket and initialize data stores.'''
+
         self.logger.debug("Connecting WebSocket.")
         self.symbol = symbol
         self.shouldAuth = shouldAuth
 
         # We can subscribe right in the connection querystring, so let's build that.
         # Subscribe to all pertinent endpoints
-        subscriptions = [sub + ':' + symbol for sub in ["quote", "trade", "orderBookL2"]]
-        subscriptions += ["instrument"] # We want all of them
+        subscriptions = [sub + ':' + symbol for sub in ["quote", "trade"]]
+        subscriptions += ["instrument"]  # We want all of them
         if self.shouldAuth:
             subscriptions += [sub + ':' + symbol for sub in ["order", "execution"]]
             subscriptions += ["margin", "position"]
@@ -79,7 +58,7 @@ class BitMEXWebsocket:
         urlParts[2] = "/realtime?subscribe=" + ",".join(subscriptions)
         wsURL = urlunparse(urlParts)
         self.logger.info("Connecting to %s" % wsURL)
-        self.__connect(wsURL, symbol)
+        self.__connect(wsURL)
         self.logger.info('Connected to WS. Waiting for data images, this may take a moment...')
 
         # Connected. Wait for partials
@@ -88,78 +67,51 @@ class BitMEXWebsocket:
             self.__wait_for_account()
         self.logger.info('Got all market data. Starting.')
 
-    def exit(self):
-        '''Call this to exit - will close websocket.'''
-        self.exited = True
-        self.ws.close()
-
-    def get_instrument(self):
-        '''Get the raw instrument data for this symbol.'''
+    #
+    # Data methods
+    #
+    def get_instrument(self, symbol):
+        instruments = self.data['instrument']
+        matchingInstruments = [i for i in instruments if i['symbol'] == symbol]
+        if len(matchingInstruments) == 0:
+            raise Exception("Unable to find instrument or index with symbol: " + symbol)
+        instrument = matchingInstruments[0]
         # Turn the 'tickSize' into 'tickLog' for use in rounding
-        instrument = self.data['instrument'][0]
+        # http://stackoverflow.com/a/6190291/832202
         instrument['tickLog'] = decimal.Decimal(str(instrument['tickSize'])).as_tuple().exponent * -1
         return instrument
 
-    def get_ticker(self):
-        '''Return a ticker object. Generated from quote and trade.'''
-        max_buy = 0
-        min_sell = 100000
-        for o in self.data['orderBookL2']:
-            if o['side'] == 'Buy':
-                if o['price'] > max_buy:
-                    max_buy = o['price']
-            if o['side'] == 'Sell':
-                if o['price'] < min_sell:
-                    min_sell = o['price']
+    def get_ticker(self, symbol):
+        '''Return a ticker object. Generated from instrument.'''
 
-        if max_buy > min_sell:
-            max_buy = self.data['trade'][0]['price'] - 0.5
-            min_sell = self.data['trade'][0]['price'] + 0.5
-        print("last trade : %f" % self.data['trade'][0]['price'])
+        instrument = self.get_instrument(symbol)
 
-        #print(self.data['orderBookL2'][len(self.data['orderBookL2']) / 2])
-        ticker = {
-            "last": round((max_buy * 2)) / 2,
-            "buy": round((max_buy * 2)) / 2,
-            "sell": round((min_sell * 2)) / 2,
-            "mid": round((min_sell * 2)) / 2
-        }
+        # If this is an index, we have to get the data from the last trade.
+        if instrument['symbol'][0] == '.':
+            ticker = {}
+            ticker['mid'] = ticker['buy'] = ticker['sell'] = ticker['last'] = instrument['markPrice']
+        # Normal instrument
+        else:
+            bid = instrument['bidPrice'] or instrument['lastPrice']
+            ask = instrument['askPrice'] or instrument['lastPrice']
+            ticker = {
+                "last": instrument['lastPrice'],
+                "buy": bid,
+                "sell": ask,
+                "mid": (bid + ask) / 2
+            }
 
         # The instrument has a tickSize. Use it to round values.
-        #instrument = self.data['instrument'][0]
-        return ticker
+        return {k: toNearest(float(v or 0), instrument['tickSize']) for k, v in iteritems(ticker)}
 
     def funds(self):
-        '''Get your margin details.'''
         return self.data['margin'][0]
 
     def market_depth(self, symbol):
-        #raise NotImplementedError('orderBook is not subscribed; use askPrice and bidPrice on instrument')
-        sum_buy = 0
-        sum_sell = 0
-        ticker = self.get_ticker()
-        #instrument = self.get_instrument()
-        if self.data['trade'] is None:
-            return 0
-        for order in self.data['trade']:
-            if order["side"] == "Buy" and (order['price'] - (ticker['buy'])) > -1 :
-                sum_buy += order["size"]
-            elif order['side'] == "Sell" and (order['price'] - ticker['sell']) < 1:
-                sum_sell += order["size"]
-        self.logger.info("sum buy : %f", sum_buy)
-        self.logger.info("sum_sell : %f", sum_sell)
-        if (sum_buy != 0 and sum_sell != 0):
-            ask_thresold = float(sum_buy - sum_sell) / float(sum_buy + sum_sell)
-            bid_thresold = float(sum_sell - sum_buy) / float(sum_buy + sum_sell)
-        else:
-            ask_thresold = 0
+        raise NotImplementedError('orderBook is not subscribed; use askPrice and bidPrice on instrument')
+        # return self.data['orderBook25'][0]
 
-        #self.logger.info("ask_thresold : %f", ask_thresold)
-        #self.logger.info("bid_thresold : %f", bid_thresold)
-        return ask_thresold
-        #return self.data['orderBookL2']
     def open_orders(self, clOrdIDPrefix):
-        '''Get all your open orders.'''
         orders = self.data['order']
         # Filter to only open orders (leavesQty > 0) and those that we actually placed
         return [o for o in orders if str(o['clOrdID']).startswith(clOrdIDPrefix) and o['leavesQty'] > 0]
@@ -171,73 +123,72 @@ class BitMEXWebsocket:
             # No position found; stub it
             return {'avgCostPrice': 0, 'avgEntryPrice': 0, 'currentQty': 0, 'symbol': symbol}
         return pos[0]
+
     def recent_trades(self):
-        '''Get recent trades.'''
         return self.data['trade']
 
     #
-    # End Public Methods
+    # Lifecycle methods
+    #
+    def error(self, err):
+        self._error = err
+        self.logger.error(err)
+        self.exit()
+
+    def exit(self):
+        self.exited = True
+        self.ws.close()
+
+    #
+    # Private methods
     #
 
-    def __connect(self, wsURL, symbol):
+    def __connect(self, wsURL):
         '''Connect to the websocket in a thread.'''
         self.logger.debug("Starting thread")
 
+        ssl_defaults = ssl.get_default_verify_paths()
+        sslopt_ca_certs = {'ca_certs': ssl_defaults.cafile}
         self.ws = websocket.WebSocketApp(wsURL,
                                          on_message=self.__on_message,
                                          on_close=self.__on_close,
                                          on_open=self.__on_open,
                                          on_error=self.__on_error,
-                                         header=self.__get_auth())
+                                         header=self.__get_auth()
+                                         )
 
-        self.wst = threading.Thread(target=lambda: self.ws.run_forever())
+        setup_custom_logger('websocket', log_level=settings.LOG_LEVEL)
+        self.wst = threading.Thread(target=lambda: self.ws.run_forever(sslopt=sslopt_ca_certs))
         self.wst.daemon = True
         self.wst.start()
-        self.logger.debug("Started thread")
+        self.logger.info("Started thread")
 
         # Wait for connect before continuing
-        conn_timeout = 100
-        while not self.ws.sock or not self.ws.sock.connected and conn_timeout:
+        conn_timeout = 5
+        while (not self.ws.sock or not self.ws.sock.connected) and conn_timeout and not self._error:
             sleep(1)
             conn_timeout -= 1
-        if not conn_timeout:
-            self.logger.info("Couldn't connect to WS! Exiting.")
-            #self.exit()
-            #raise websocket.WebSocketTimeoutException('Couldn\'t connect to WS! Exiting.')
+
+        if not conn_timeout or self._error:
+            self.logger.error("Couldn't connect to WS! Exiting.")
+            self.exit()
+            sys.exit(1)
 
     def __get_auth(self):
         '''Return auth headers. Will use API Keys if present in settings.'''
-        if self.shouldAuth:
-            self.logger.info("Authenticating with API Key.")
-            # To auth to the WS using an API key, we generate a signature of a nonce and
-            # the WS API endpoint.
-            nonce = generate_nonce()
-            return [
-                "api-nonce: " + str(nonce),
-                "api-signature: " + generate_signature(settings.API_SECRET, 'GET', '/realtime', nonce, ''),
-                "api-key:" + settings.API_KEY
-            ]
-        else:
-            self.logger.info("Not authenticating.")
+
+        if self.shouldAuth is False:
             return []
 
-    def __get_url(self):
-        '''
-        Generate a connection URL. We can define subscriptions right in the querystring.
-        Most subscription topics are scoped by the symbol we're listening to.
-        '''
-
-        # You can sub to orderBookL2 for all levels, or orderBook10 for top 10 levels & save bandwidth
-        symbolSubs = ["execution", "instrument", "order", "orderBookL2", "position", "quote", "trade"]
-        genericSubs = ["margin"]
-
-        subscriptions = [sub + ':' + self.symbol for sub in symbolSubs]
-        subscriptions += genericSubs
-
-        urlParts = list(urllib.parse.urlparse(self.endpoint))
-        urlParts[0] = urlParts[0].replace('http', 'ws')
-        urlParts[2] = "/realtime?subscribe={}".format(','.join(subscriptions))
-        return urllib.parse.urlunparse(urlParts)
+        self.logger.info("Authenticating with API Key.")
+        # To auth to the WS using an API key, we generate a signature of a nonce and
+        # the WS API endpoint.
+        nonce = generate_expires()
+        return [
+            "api-expires: " + str(nonce),
+            "api-signature: " + generate_signature(settings.API_SECRET, 'GET', '/realtime', nonce, ''),
+            "api-key:" + settings.API_KEY
+        ]
 
     def __wait_for_account(self):
         '''On subscribe, this data will come down. Wait for it.'''
@@ -250,13 +201,11 @@ class BitMEXWebsocket:
         while not {'instrument', 'trade', 'quote'} <= set(self.data):
             sleep(0.1)
 
-    def __send_command(self, command, args=None):
+    def __send_command(self, command, args):
         '''Send a raw command.'''
-        if args is None:
-            args = []
-        self.ws.send(json.dumps({"op": command, "args": args}))
+        self.ws.send(json.dumps({"op": command, "args": args or []}))
 
-    def __on_message(self, ws, message):
+    def __on_message(self, message):
         '''Handler for parsing WS messages.'''
         message = json.loads(message)
         self.logger.debug(json.dumps(message))
@@ -265,7 +214,16 @@ class BitMEXWebsocket:
         action = message['action'] if 'action' in message else None
         try:
             if 'subscribe' in message:
-                self.logger.debug("Subscribed to %s." % message['subscribe'])
+                if message['success']:
+                    self.logger.debug("Subscribed to %s." % message['subscribe'])
+                else:
+                    self.error("Unable to subscribe to %s. Error: \"%s\" Please check and restart." %
+                               (message['request']['args'][0], message['error']))
+            elif 'status' in message:
+                if message['status'] == 400:
+                    self.error(message['error'])
+                if message['status'] == 401:
+                    self.error("API Key incorrect, please check and restart.")
             elif action:
 
                 if table not in self.data:
@@ -273,6 +231,7 @@ class BitMEXWebsocket:
 
                 if table not in self.keys:
                     self.keys[table] = []
+
                 # There are four possible actions from the WS:
                 # 'partial' - full table image
                 # 'insert'  - new row
@@ -291,7 +250,7 @@ class BitMEXWebsocket:
                     # Limit the max length of the table to avoid excessive memory usage.
                     # Don't trim orders because we'll lose valuable state if we do.
                     if table not in ['order', 'orderBookL2'] and len(self.data[table]) > BitMEXWebsocket.MAX_TABLE_LEN:
-                        self.data[table] = self.data[table][int(BitMEXWebsocket.MAX_TABLE_LEN / 2):]
+                        self.data[table] = self.data[table][(BitMEXWebsocket.MAX_TABLE_LEN // 2):]
 
                 elif action == 'update':
                     self.logger.debug('%s: updating %s' % (table, message['data']))
@@ -299,42 +258,47 @@ class BitMEXWebsocket:
                     for updateData in message['data']:
                         item = findItemByKeys(self.keys[table], self.data[table], updateData)
                         if not item:
-                            return  # No item found to update. Could happen before push
+                            continue  # No item found to update. Could happen before push
+
+                        # Log executions
+                        if table == 'order':
+                            is_canceled = 'ordStatus' in updateData and updateData['ordStatus'] == 'Canceled'
+                            if 'cumQty' in updateData and not is_canceled:
+                                contExecuted = updateData['cumQty'] - item['cumQty']
+                                if contExecuted > 0:
+                                    instrument = self.get_instrument(item['symbol'])
+                                    self.logger.info("Execution: %s %d Contracts of %s at %.*f" %
+                                             (item['side'], contExecuted, item['symbol'],
+                                              instrument['tickLog'], item['price']))
+
+                        # Update this item.
                         item.update(updateData)
-                        # Remove cancelled / filled orders
+
+                        # Remove canceled / filled orders
                         if table == 'order' and item['leavesQty'] <= 0:
                             self.data[table].remove(item)
+
                 elif action == 'delete':
                     self.logger.debug('%s: deleting %s' % (table, message['data']))
                     # Locate the item in the collection and remove it.
                     for deleteData in message['data']:
                         item = findItemByKeys(self.keys[table], self.data[table], deleteData)
-                        if item in self.data[table]:
-                            self.data[table].remove(item)
+                        self.data[table].remove(item)
                 else:
                     raise Exception("Unknown action: %s" % action)
         except:
-            self.logger.info(traceback.format_exc())
-            #self.exit()
+            self.logger.error(traceback.format_exc())
 
-    def error(self, err):
-        self._error = err
-        self.logger.error(err)
-        #self.exit()
-    def __on_error(self, ws, error):
-        '''Called on fatal websocket errors. We exit on these.'''
-        if not self.exited:
-            self.logger.error("Error : %s" % error)
-            self.error(error)
-
-    def __on_open(self, ws):
-        '''Called when the WS opens.'''
+    def __on_open(self):
         self.logger.debug("Websocket Opened.")
 
-    def __on_close(self, ws):
-        '''Called on websocket close.'''
+    def __on_close(self):
         self.logger.info('Websocket Closed')
         self.exit()
+
+    def __on_error(self, ws, error):
+        if not self.exited:
+            self.error(error)
 
     def __reset(self):
         self.data = {}
@@ -343,13 +307,6 @@ class BitMEXWebsocket:
         self._error = None
 
 
-# Utility method for finding an item in the store.
-# When an update comes through on the websocket, we need to figure out which item in the array it is
-# in order to match that item.
-#
-# Helpfully, on a data push (or on an HTTP hit to /api/v1/schema), we have a "keys" array. These are the
-# fields we can use to uniquely identify an item. Sometimes there is more than one, so we iterate through all
-# provided keys.
 def findItemByKeys(keys, table, matchData):
     for item in table:
         matched = True
@@ -358,3 +315,20 @@ def findItemByKeys(keys, table, matchData):
                 matched = False
         if matched:
             return item
+
+if __name__ == "__main__":
+    # create console handler and set level to debug
+    logger = logging.getLogger()
+    logger.setLevel(logging.DEBUG)
+    ch = logging.StreamHandler()
+    # create formatter
+    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    # add formatter to ch
+    ch.setFormatter(formatter)
+    logger.addHandler(ch)
+    ws = BitMEXWebsocket()
+    ws.logger = logger
+    ws.connect("https://bitmex.com/api/v1")
+    while(ws.ws.sock.connected):
+        sleep(1)
+
