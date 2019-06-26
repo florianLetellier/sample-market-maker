@@ -81,28 +81,34 @@ class BitMEXWebsocket():
         instrument['tickLog'] = decimal.Decimal(str(instrument['tickSize'])).as_tuple().exponent * -1
         return instrument
 
-    def get_ticker(self, symbol):
-        '''Return a ticker object. Generated from instrument.'''
+    def get_ticker(self):
+        '''Return a ticker object. Generated from quote and trade.'''
+        max_buy = 0
+        min_sell = 100000
+        for o in self.data['orderBookL2']:
+            if o['side'] == 'Buy':
+                if o['price'] > max_buy:
+                    max_buy = o['price']
+            if o['side'] == 'Sell':
+                if o['price'] < min_sell:
+                    min_sell = o['price']
 
-        instrument = self.get_instrument(symbol)
+        if max_buy > min_sell:
+            max_buy = self.data['trade'][0]['price'] - 0.5
+            min_sell = self.data['trade'][0]['price'] + 0.5
+        print("last trade : %f" % self.data['trade'][0]['price'])
 
-        # If this is an index, we have to get the data from the last trade.
-        if instrument['symbol'][0] == '.':
-            ticker = {}
-            ticker['mid'] = ticker['buy'] = ticker['sell'] = ticker['last'] = instrument['markPrice']
-        # Normal instrument
-        else:
-            bid = instrument['bidPrice'] or instrument['lastPrice']
-            ask = instrument['askPrice'] or instrument['lastPrice']
-            ticker = {
-                "last": instrument['lastPrice'],
-                "buy": bid,
-                "sell": ask,
-                "mid": (bid + ask) / 2
-            }
+        #print(self.data['orderBookL2'][len(self.data['orderBookL2']) / 2])
+        ticker = {
+            "last": round((max_buy * 2)) / 2,
+            "buy": round((max_buy * 2)) / 2,
+            "sell": round((min_sell * 2)) / 2,
+            "mid": round((min_sell * 2)) / 2
+        }
 
         # The instrument has a tickSize. Use it to round values.
-        return {k: toNearest(float(v or 0), instrument['tickSize']) for k, v in iteritems(ticker)}
+        #instrument = self.data['instrument'][0]
+        return ticker
 
     def funds(self):
         return self.data['margin'][0]
