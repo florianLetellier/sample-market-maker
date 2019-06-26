@@ -81,7 +81,7 @@ class BitMEXWebsocket():
         instrument['tickLog'] = decimal.Decimal(str(instrument['tickSize'])).as_tuple().exponent * -1
         return instrument
 
-    def get_ticker(self):
+    def get_ticker(self, symbol):
         '''Return a ticker object. Generated from quote and trade.'''
         max_buy = 0
         min_sell = 100000
