@@ -40,7 +40,7 @@ class BitMEXWebsocket():
     def connect(self, endpoint="", symbol="XBTN15", shouldAuth=True):
         '''Connect to the websocket and initialize data stores.'''
 
-        self.logger.debug("Connecting WebSocket.")
+        self.logger.debug("Connecting WebSocket. TEST TEST 42")
         self.symbol = symbol
         self.shouldAuth = shouldAuth
 
