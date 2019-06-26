@@ -57,7 +57,7 @@ class BitMEXWebsocket():
         urlParts[0] = urlParts[0].replace('http', 'ws')
         urlParts[2] = "/realtime?subscribe=" + ",".join(subscriptions)
         wsURL = urlunparse(urlParts)
-        self.logger.info("Connecting to %s" % wsURL)
+        self.logger.info("Connecting to %s TEST COUCOU" % wsURL)
         self.__connect(wsURL)
         self.logger.info('Connected to WS. Waiting for data images, this may take a moment...')
 
