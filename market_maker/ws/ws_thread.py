@@ -86,6 +86,7 @@ class BitMEXWebsocket():
         self.logger.info("GETTICKER")
         max_buy = 0
         min_sell = 100000
+        self.logger.info(self.data['orderBookL2'])
         for o in self.data['orderBookL2']:
             if o['side'] == 'Buy':
                 if o['price'] > max_buy:
