@@ -107,7 +107,7 @@ class BitMEXWebsocket():
             "sell": round((min_sell * 2)) / 2,
             "mid": round((min_sell * 2)) / 2
         }
-
+        self.logger.info(ticker)
         # The instrument has a tickSize. Use it to round values.
         #instrument = self.data['instrument'][0]
         return ticker
